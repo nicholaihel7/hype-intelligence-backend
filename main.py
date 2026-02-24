@@ -1,12 +1,8 @@
 """
-HYPE Intelligence — Scraper Backend v1.0
+HYPE Intelligence — Scraper Backend v2.0
 =========================================
-FastAPI backend with real scraping infrastructure.
-Start with: uvicorn main:app --reload --port 8000
-
-Requires:
-  pip install fastapi uvicorn playwright beautifulsoup4 httpx
-  playwright install chromium
+Playwright stealth + real browser scraping.
+uvicorn main:app --reload --port 8000
 """
 
 from fastapi import FastAPI, HTTPException, Query
@@ -17,9 +13,10 @@ import asyncio
 import json
 import re
 import time
+import random
 from datetime import datetime
 
-app = FastAPI(title="HYPE Intelligence API", version="1.0.0")
+app = FastAPI(title="HYPE Intelligence API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -29,7 +26,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─── DATA MODELS ───
+
+# ─── MODELS ───
 
 class PriceResult(BaseModel):
     platform: str
@@ -41,6 +39,7 @@ class PriceResult(BaseModel):
     seller: Optional[str] = None
     rating: Optional[float] = None
     review_count: Optional[int] = None
+    image_url: Optional[str] = None
     in_stock: bool = True
     scraped_at: str
 
@@ -53,727 +52,639 @@ class SearchResponse(BaseModel):
     search_time_ms: int
 
 
-# ─── SCRAPER BASE ───
+# ─── STEALTH BROWSER ───
 
-class BaseScraper:
-    """Base class for all platform scrapers."""
+async def get_stealth_page(playwright):
+    """Launch a stealth browser that looks like a real user."""
     
-    PLATFORM_ID = "base"
-    PLATFORM_NAME = "Base"
+    browser = await playwright.chromium.launch(
+        headless=True,
+        args=[
+            "--disable-blink-features=AutomationControlled",
+            "--disable-features=IsolateOrigins,site-per-process",
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-accelerated-2d-canvas",
+            "--disable-gpu",
+        ]
+    )
     
-    # Common headers to look like a real browser
-    HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-    }
+    context = await browser.new_context(
+        viewport={"width": 1920, "height": 1080},
+        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        locale="en-US",
+        timezone_id="America/New_York",
+        permissions=["geolocation"],
+        java_script_enabled=True,
+        has_touch=False,
+        is_mobile=False,
+        color_scheme="light",
+    )
     
-    async def search(self, query: str, max_results: int = 5) -> list[PriceResult]:
-        raise NotImplementedError
-
-
-# ─── AMAZON US SCRAPER ───
-
-class AmazonUSScraper(BaseScraper):
-    """
-    Amazon US scraper using httpx + BeautifulSoup.
-    Falls back to Playwright for JS-heavy pages.
-    """
-    
-    PLATFORM_ID = "amazon_us"
-    PLATFORM_NAME = "Amazon US"
-    BASE_URL = "https://www.amazon.com"
-    
-    async def search(self, query: str, max_results: int = 5) -> list[PriceResult]:
-        """Search Amazon US and extract product prices."""
+    # Stealth: Override navigator.webdriver
+    await context.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', { get: () => false });
+        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+        window.chrome = { runtime: {} };
         
-        # Strategy 1: Direct HTTP request (fast, cheap)
-        results = await self._search_http(query, max_results)
-        
-        # Strategy 2: If HTTP fails or returns 0, use Playwright (slower, reliable)
-        if not results:
-            results = await self._search_playwright(query, max_results)
-        
-        return results
+        // Override permissions
+        const originalQuery = window.navigator.permissions.query;
+        window.navigator.permissions.query = (parameters) => (
+            parameters.name === 'notifications' ?
+                Promise.resolve({ state: Notification.permission }) :
+                originalQuery(parameters)
+        );
+    """)
     
-    async def _search_http(self, query: str, max_results: int) -> list[PriceResult]:
-        """Fast HTTP-based scraping with httpx + BeautifulSoup."""
+    page = await context.new_page()
+    return browser, page
+
+
+async def stealth_goto(page, url, wait_selector=None, timeout=20000):
+    """Navigate with random delays to mimic human behavior."""
+    
+    await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+    
+    # Random small delay like a human would have
+    await asyncio.sleep(random.uniform(1.0, 2.5))
+    
+    if wait_selector:
         try:
-            import httpx
-            from bs4 import BeautifulSoup
-            
-            search_url = f"{self.BASE_URL}/s"
-            params = {
-                "k": query,
-                "ref": "nb_sb_noss",
-            }
-            
-            async with httpx.AsyncClient(
-                headers=self.HEADERS,
-                follow_redirects=True,
-                timeout=15.0,
-            ) as client:
-                response = await client.get(search_url, params=params)
-                
-                if response.status_code != 200:
-                    print(f"[Amazon HTTP] Status {response.status_code}")
-                    return []
-                
-                soup = BeautifulSoup(response.text, "html.parser")
-                return self._parse_search_results(soup, max_results)
-                
-        except Exception as e:
-            print(f"[Amazon HTTP] Error: {e}")
-            return []
+            await page.wait_for_selector(wait_selector, timeout=10000)
+        except:
+            # Selector not found, continue anyway
+            await asyncio.sleep(1)
     
-    async def _search_playwright(self, query: str, max_results: int) -> list[PriceResult]:
-        """Playwright-based scraping for JS-rendered pages."""
+    # Scroll down a bit like a human
+    await page.evaluate("window.scrollBy(0, 300)")
+    await asyncio.sleep(random.uniform(0.3, 0.8))
+    
+    return await page.content()
+
+
+# ─── PARSERS ───
+
+def parse_amazon_results(html, max_results=5, currency="$", platform_id="amazon_us", platform_name="Amazon US"):
+    """Parse Amazon search results HTML."""
+    from bs4 import BeautifulSoup
+    
+    soup = BeautifulSoup(html, "html.parser")
+    results = []
+    
+    items = soup.select('[data-component-type="s-search-result"]')
+    
+    for item in items:
+        if len(results) >= max_results:
+            break
+        
         try:
-            from playwright.async_api import async_playwright
-            from bs4 import BeautifulSoup
-            
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-                context = await browser.new_context(
-                    user_agent=self.HEADERS["User-Agent"],
-                    viewport={"width": 1920, "height": 1080},
-                )
-                page = await context.new_page()
-                
-                search_url = f"{self.BASE_URL}/s?k={query.replace(' ', '+')}"
-                await page.goto(search_url, wait_until="domcontentloaded", timeout=20000)
-                
-                # Wait for product grid to load
-                await page.wait_for_selector('[data-component-type="s-search-result"]', timeout=10000)
-                
-                html = await page.content()
-                await browser.close()
-                
-                soup = BeautifulSoup(html, "html.parser")
-                return self._parse_search_results(soup, max_results)
-                
-        except Exception as e:
-            print(f"[Amazon Playwright] Error: {e}")
-            return []
-    
-    def _parse_search_results(self, soup, max_results: int) -> list[PriceResult]:
-        """Parse Amazon search results page."""
-        from bs4 import BeautifulSoup
-        
-        results = []
-        
-        # Amazon uses data-component-type="s-search-result" for each product
-        items = soup.select('[data-component-type="s-search-result"]')
-        
-        for item in items[:max_results * 2]:  # Get extra in case some fail
-            if len(results) >= max_results:
-                break
-                
-            try:
-                result = self._parse_single_item(item)
-                if result:
-                    results.append(result)
-            except Exception as e:
-                print(f"[Amazon Parse] Skipping item: {e}")
+            # Skip sponsored
+            sponsored = item.select_one('[data-component-type="sp-sponsored-result"]')
+            if sponsored:
                 continue
-        
+            ad_badge = item.find(string=re.compile(r"Sponsored", re.I))
+            if ad_badge:
+                continue
+            
+            # Title
+            title_el = item.select_one("h2 a span") or item.select_one("h2 span")
+            if not title_el:
+                continue
+            name = title_el.get_text(strip=True)
+            if len(name) < 5:
+                continue
+            
+            # Price
+            price = None
+            
+            # Method 1: a-offscreen
+            offscreen = item.select_one(".a-price:not(.a-text-price) .a-offscreen")
+            if offscreen:
+                price = parse_price(offscreen.get_text(), currency)
+            
+            # Method 2: whole + fraction
+            if not price:
+                whole_el = item.select_one(".a-price:not(.a-text-price) .a-price-whole")
+                frac_el = item.select_one(".a-price:not(.a-text-price) .a-price-fraction")
+                if whole_el:
+                    w = whole_el.get_text(strip=True).replace(",", "").replace(".", "")
+                    f = frac_el.get_text(strip=True) if frac_el else "00"
+                    try:
+                        price = float(f"{w}.{f}")
+                    except:
+                        pass
+            
+            if not price:
+                continue
+            
+            # URL
+            link_el = item.select_one("h2 a")
+            url = ""
+            if link_el and link_el.get("href"):
+                href = link_el["href"]
+                base = "https://www.amazon.com" if platform_id == "amazon_us" else "https://www.amazon.de"
+                url = f"{base}{href}" if href.startswith("/") else href
+            
+            # Rating
+            rating = None
+            rating_el = item.select_one("[aria-label*='out of 5']")
+            if rating_el:
+                m = re.search(r"(\d+\.?\d*)\s+out", rating_el.get("aria-label", ""))
+                if m:
+                    rating = float(m.group(1))
+            
+            # Image
+            img = None
+            img_el = item.select_one("img.s-image")
+            if img_el:
+                img = img_el.get("src")
+            
+            results.append(PriceResult(
+                platform=platform_id,
+                platform_name=platform_name,
+                product_name=name,
+                price=price,
+                currency=currency,
+                url=url,
+                rating=rating,
+                image_url=img,
+                scraped_at=datetime.utcnow().isoformat(),
+            ))
+        except Exception as e:
+            continue
+    
+    return results
+
+
+def parse_walmart_results(html, max_results=5):
+    """Parse Walmart search results."""
+    from bs4 import BeautifulSoup
+    
+    soup = BeautifulSoup(html, "html.parser")
+    results = []
+    
+    # Try JSON-LD first (Walmart embeds structured data)
+    scripts = soup.select('script[type="application/ld+json"]')
+    for script in scripts:
+        try:
+            data = json.loads(script.string)
+            if isinstance(data, dict) and data.get("@type") == "ItemList":
+                for item in data.get("itemListElement", [])[:max_results]:
+                    offer = item.get("offers", {})
+                    results.append(PriceResult(
+                        platform="walmart",
+                        platform_name="Walmart",
+                        product_name=item.get("name", ""),
+                        price=float(offer.get("price", 0)),
+                        currency="$",
+                        url=item.get("url", ""),
+                        image_url=item.get("image", ""),
+                        scraped_at=datetime.utcnow().isoformat(),
+                    ))
+        except:
+            continue
+    
+    if results:
         return results
     
-    def _parse_single_item(self, item) -> Optional[PriceResult]:
-        """Parse a single Amazon search result item."""
-        
-        # Skip sponsored/ad results
-        if item.select_one('.s-label-popover-default'):
-            sponsored_text = item.select_one('.s-label-popover-default')
-            if sponsored_text and 'Sponsored' in sponsored_text.get_text():
-                return None
-        
-        # Product name
-        title_elem = item.select_one('h2 a span') or item.select_one('h2 span')
-        if not title_elem:
-            return None
-        product_name = title_elem.get_text(strip=True)
-        
-        if not product_name or len(product_name) < 5:
-            return None
-        
-        # Price - Amazon has multiple price formats
-        price = self._extract_price(item)
-        if not price:
-            return None
-        
-        # Product URL
-        link_elem = item.select_one('h2 a')
-        url = ""
-        if link_elem and link_elem.get('href'):
-            href = link_elem['href']
-            if href.startswith('/'):
-                url = f"{self.BASE_URL}{href}"
+    # Fallback: HTML parsing
+    items = soup.select('[data-item-id]') or soup.select('[link-identifier]')
+    
+    for item in items:
+        if len(results) >= max_results:
+            break
+        try:
+            title_el = item.select_one('[data-automation-id="product-title"]') or item.select_one("span.lh-title")
+            if not title_el:
+                continue
+            name = title_el.get_text(strip=True)
+            
+            price_el = item.select_one('[data-automation-id="product-price"] .f2') or item.select_one('[itemprop="price"]')
+            if not price_el:
+                # Try any element with $ sign
+                all_text = item.get_text()
+                m = re.search(r"\$(\d+(?:,\d{3})*(?:\.\d{2})?)", all_text)
+                if m:
+                    price = float(m.group(1).replace(",", ""))
+                else:
+                    continue
             else:
-                url = href
-        
-        # Rating
-        rating = None
-        rating_elem = item.select_one('[aria-label*="out of 5 stars"]')
-        if rating_elem:
-            rating_text = rating_elem.get('aria-label', '')
-            match = re.search(r'(\d+\.?\d*)\s+out of\s+5', rating_text)
-            if match:
-                rating = float(match.group(1))
-        
-        # Review count
-        review_count = None
-        review_elem = item.select_one('[aria-label*="ratings"]') or item.select_one('.s-link-style .s-underline-text')
-        if review_elem:
-            review_text = review_elem.get_text(strip=True).replace(',', '')
-            match = re.search(r'(\d+)', review_text)
-            if match:
-                review_count = int(match.group(1))
-        
-        # Seller
-        seller = None
-        seller_elem = item.select_one('.a-row.a-size-base.a-color-secondary .a-size-base')
-        if seller_elem:
-            seller = seller_elem.get_text(strip=True)
-        
-        return PriceResult(
-            platform=self.PLATFORM_ID,
-            platform_name=self.PLATFORM_NAME,
-            product_name=product_name,
-            price=price,
-            currency="$",
-            url=url,
-            seller=seller,
-            rating=rating,
-            review_count=review_count,
-            in_stock=True,
-            scraped_at=datetime.utcnow().isoformat(),
-        )
+                price = parse_price(price_el.get_text(), "$")
+                if not price:
+                    continue
+            
+            link = item.select_one('a[href*="/ip/"]')
+            url = f"https://www.walmart.com{link['href']}" if link and link.get("href", "").startswith("/") else ""
+            
+            img = None
+            img_el = item.select_one("img[data-testid='productTileImage']") or item.select_one("img")
+            if img_el:
+                img = img_el.get("src")
+            
+            results.append(PriceResult(
+                platform="walmart",
+                platform_name="Walmart",
+                product_name=name,
+                price=price,
+                currency="$",
+                url=url,
+                image_url=img,
+                scraped_at=datetime.utcnow().isoformat(),
+            ))
+        except:
+            continue
     
-    def _extract_price(self, item) -> Optional[float]:
-        """Extract price from Amazon product item. Handles multiple formats."""
-        
-        # Format 1: span.a-price > span.a-offscreen (most common)
-        price_elem = item.select_one('.a-price:not(.a-text-price) .a-offscreen')
-        if price_elem:
-            return self._parse_price_text(price_elem.get_text())
-        
-        # Format 2: span.a-price > span.a-price-whole + span.a-price-fraction
-        whole = item.select_one('.a-price:not(.a-text-price) .a-price-whole')
-        fraction = item.select_one('.a-price:not(.a-text-price) .a-price-fraction')
-        if whole:
-            whole_text = whole.get_text(strip=True).replace(',', '').replace('.', '')
-            frac_text = fraction.get_text(strip=True) if fraction else "00"
-            try:
-                return float(f"{whole_text}.{frac_text}")
-            except ValueError:
-                pass
-        
-        # Format 3: Generic price pattern in text
-        price_container = item.select_one('.a-price')
-        if price_container:
-            text = price_container.get_text()
-            return self._parse_price_text(text)
-        
+    return results
+
+
+def parse_bestbuy_results(html, max_results=5):
+    """Parse Best Buy search results."""
+    from bs4 import BeautifulSoup
+    
+    soup = BeautifulSoup(html, "html.parser")
+    results = []
+    
+    items = soup.select(".sku-item") or soup.select('[class*="sku-item"]') or soup.select(".list-item")
+    
+    for item in items:
+        if len(results) >= max_results:
+            break
+        try:
+            title_el = item.select_one(".sku-title a") or item.select_one("h4 a")
+            if not title_el:
+                continue
+            name = title_el.get_text(strip=True)
+            
+            price_el = item.select_one(".priceView-customer-price span") or item.select_one('[data-testid="customer-price"] span')
+            if not price_el:
+                continue
+            price = parse_price(price_el.get_text(), "$")
+            if not price:
+                continue
+            
+            href = title_el.get("href", "")
+            url = f"https://www.bestbuy.com{href}" if href.startswith("/") else href
+            
+            img = None
+            img_el = item.select_one(".product-image img") or item.select_one("img")
+            if img_el:
+                img = img_el.get("src")
+            
+            results.append(PriceResult(
+                platform="bestbuy",
+                platform_name="Best Buy",
+                product_name=name,
+                price=price,
+                currency="$",
+                url=url,
+                image_url=img,
+                scraped_at=datetime.utcnow().isoformat(),
+            ))
+        except:
+            continue
+    
+    return results
+
+
+def parse_trendyol_results(html, max_results=5):
+    """Parse Trendyol search results."""
+    from bs4 import BeautifulSoup
+    
+    soup = BeautifulSoup(html, "html.parser")
+    results = []
+    
+    items = soup.select(".p-card-wrppr") or soup.select('[class*="prdct-cntnr"]')
+    
+    for item in items:
+        if len(results) >= max_results:
+            break
+        try:
+            brand_el = item.select_one(".prdct-desc-cntnr-ttl") or item.select_one('[class*="brand"]')
+            title_el = item.select_one(".prdct-desc-cntnr-name") or item.select_one('[class*="prdct-desc"]')
+            
+            brand = brand_el.get_text(strip=True) if brand_el else ""
+            title = title_el.get_text(strip=True) if title_el else ""
+            name = f"{brand} {title}".strip()
+            if len(name) < 3:
+                continue
+            
+            price_el = item.select_one(".prc-box-dscntd") or item.select_one(".prc-box-sllng")
+            if not price_el:
+                continue
+            price = parse_turkish_price(price_el.get_text())
+            if not price:
+                continue
+            
+            link = item.select_one("a")
+            href = link.get("href", "") if link else ""
+            url = f"https://www.trendyol.com{href}" if href.startswith("/") else href
+            
+            img = None
+            img_el = item.select_one("img.p-card-img") or item.select_one("img")
+            if img_el:
+                img = img_el.get("src") or img_el.get("data-src")
+            
+            results.append(PriceResult(
+                platform="trendyol",
+                platform_name="Trendyol",
+                product_name=name,
+                price=price,
+                currency="TRY",
+                url=url,
+                image_url=img,
+                scraped_at=datetime.utcnow().isoformat(),
+            ))
+        except:
+            continue
+    
+    return results
+
+
+def parse_hepsiburada_results(html, max_results=5):
+    """Parse Hepsiburada search results."""
+    from bs4 import BeautifulSoup
+    
+    soup = BeautifulSoup(html, "html.parser")
+    results = []
+    
+    items = soup.select('[data-test-id="product-card-item"]') or soup.select(".productListContent-item") or soup.select('[class*="product-card"]')
+    
+    for item in items:
+        if len(results) >= max_results:
+            break
+        try:
+            title_el = item.select_one('[data-test-id="product-card-name"]') or item.select_one("h3") or item.select_one('[class*="product-title"]')
+            if not title_el:
+                continue
+            name = title_el.get_text(strip=True)
+            
+            price_el = item.select_one('[data-test-id="price-current-price"]') or item.select_one('[class*="product-price"]')
+            if not price_el:
+                continue
+            price = parse_turkish_price(price_el.get_text())
+            if not price:
+                continue
+            
+            link = item.select_one("a")
+            href = link.get("href", "") if link else ""
+            url = f"https://www.hepsiburada.com{href}" if href and not href.startswith("http") else href
+            
+            img = None
+            img_el = item.select_one("img")
+            if img_el:
+                img = img_el.get("src") or img_el.get("data-src")
+            
+            results.append(PriceResult(
+                platform="hepsiburada",
+                platform_name="Hepsiburada",
+                product_name=name,
+                price=price,
+                currency="TRY",
+                url=url,
+                image_url=img,
+                scraped_at=datetime.utcnow().isoformat(),
+            ))
+        except:
+            continue
+    
+    return results
+
+
+# ─── PRICE UTILS ───
+
+def parse_price(text, currency="$"):
+    """Parse US/EU price: $1,049.99 or €1.049,99"""
+    if not text:
         return None
-    
-    def _parse_price_text(self, text: str) -> Optional[float]:
-        """Parse price from text like '$1,049.99' or '₺42.999,00'."""
-        if not text:
-            return None
-        # Remove currency symbols and whitespace
-        cleaned = re.sub(r'[^\d.,]', '', text.strip())
-        if not cleaned:
-            return None
-        
-        # US format: 1,049.99
-        try:
-            # Remove commas used as thousand separators
-            if '.' in cleaned and ',' in cleaned:
-                # Determine format by position
-                if cleaned.rindex('.') > cleaned.rindex(','):
-                    # US: 1,049.99
-                    cleaned = cleaned.replace(',', '')
-                else:
-                    # EU: 1.049,99
-                    cleaned = cleaned.replace('.', '').replace(',', '.')
-            elif ',' in cleaned and '.' not in cleaned:
-                # Could be thousand separator (1,049) or decimal (49,99)
-                parts = cleaned.split(',')
-                if len(parts[-1]) == 2:
-                    cleaned = cleaned.replace(',', '.')
-                else:
-                    cleaned = cleaned.replace(',', '')
-            
-            return float(cleaned)
-        except ValueError:
-            return None
+    cleaned = re.sub(r"[^\d.,]", "", text.strip())
+    if not cleaned:
+        return None
+    try:
+        if "." in cleaned and "," in cleaned:
+            if cleaned.rindex(".") > cleaned.rindex(","):
+                cleaned = cleaned.replace(",", "")
+            else:
+                cleaned = cleaned.replace(".", "").replace(",", ".")
+        elif "," in cleaned:
+            parts = cleaned.split(",")
+            if len(parts[-1]) == 2:
+                cleaned = cleaned.replace(",", ".")
+            else:
+                cleaned = cleaned.replace(",", "")
+        return float(cleaned)
+    except:
+        return None
 
 
-# ─── WALMART SCRAPER ───
-
-class WalmartScraper(BaseScraper):
-    """Walmart scraper."""
-    
-    PLATFORM_ID = "walmart"
-    PLATFORM_NAME = "Walmart"
-    BASE_URL = "https://www.walmart.com"
-    
-    async def search(self, query: str, max_results: int = 5) -> list[PriceResult]:
-        try:
-            import httpx
-            from bs4 import BeautifulSoup
-            
-            search_url = f"{self.BASE_URL}/search"
-            params = {"q": query}
-            
-            async with httpx.AsyncClient(
-                headers={**self.HEADERS, "Accept": "text/html"},
-                follow_redirects=True,
-                timeout=15.0,
-            ) as client:
-                response = await client.get(search_url, params=params)
-                
-                if response.status_code != 200:
-                    print(f"[Walmart] Status {response.status_code}")
-                    return []
-                
-                soup = BeautifulSoup(response.text, "html.parser")
-                return self._parse_results(soup, max_results)
-                
-        except Exception as e:
-            print(f"[Walmart] Error: {e}")
-            return []
-    
-    def _parse_results(self, soup, max_results: int) -> list[PriceResult]:
-        results = []
-        
-        # Walmart uses [data-item-id] for product cards
-        items = soup.select('[data-item-id]')
-        
-        for item in items[:max_results * 2]:
-            if len(results) >= max_results:
-                break
-            try:
-                # Title
-                title_elem = item.select_one('[data-automation-id="product-title"]') or item.select_one('a span')
-                if not title_elem:
-                    continue
-                name = title_elem.get_text(strip=True)
-                if len(name) < 5:
-                    continue
-                
-                # Price
-                price_elem = item.select_one('[data-automation-id="product-price"] .f2') or item.select_one('[itemprop="price"]')
-                if not price_elem:
-                    continue
-                price_text = price_elem.get_text(strip=True)
-                price = self._parse_price(price_text)
-                if not price:
-                    continue
-                
-                # URL
-                link = item.select_one('a[href*="/ip/"]')
-                url = f"{self.BASE_URL}{link['href']}" if link and link.get('href', '').startswith('/') else ""
-                
-                results.append(PriceResult(
-                    platform=self.PLATFORM_ID,
-                    platform_name=self.PLATFORM_NAME,
-                    product_name=name,
-                    price=price,
-                    currency="$",
-                    url=url,
-                    scraped_at=datetime.utcnow().isoformat(),
-                ))
-            except Exception as e:
-                continue
-        
-        return results
-    
-    def _parse_price(self, text: str) -> Optional[float]:
-        cleaned = re.sub(r'[^\d.,]', '', text)
-        try:
-            return float(cleaned.replace(',', ''))
-        except:
-            return None
+def parse_turkish_price(text):
+    """Parse Turkish price: 42.999,00 TL → 42999.00"""
+    if not text:
+        return None
+    cleaned = re.sub(r"[^\d.,]", "", text.strip())
+    if not cleaned:
+        return None
+    try:
+        cleaned = cleaned.replace(".", "").replace(",", ".")
+        return float(cleaned)
+    except:
+        return None
 
 
-# ─── BEST BUY SCRAPER ───
+# ─── SEARCH FUNCTIONS ───
 
-class BestBuyScraper(BaseScraper):
-    """Best Buy scraper."""
+async def search_amazon_us(query, max_results=5):
+    """Search Amazon US with stealth browser."""
+    from playwright.async_api import async_playwright
     
-    PLATFORM_ID = "bestbuy"
-    PLATFORM_NAME = "Best Buy"
-    BASE_URL = "https://www.bestbuy.com"
-    
-    async def search(self, query: str, max_results: int = 5) -> list[PriceResult]:
-        try:
-            import httpx
-            from bs4 import BeautifulSoup
-            
-            search_url = f"{self.BASE_URL}/site/searchpage.jsp"
-            params = {"st": query}
-            
-            async with httpx.AsyncClient(
-                headers=self.HEADERS,
-                follow_redirects=True,
-                timeout=15.0,
-            ) as client:
-                response = await client.get(search_url, params=params)
-                
-                if response.status_code != 200:
-                    return []
-                
-                soup = BeautifulSoup(response.text, "html.parser")
-                return self._parse_results(soup, max_results)
-                
-        except Exception as e:
-            print(f"[BestBuy] Error: {e}")
-            return []
-    
-    def _parse_results(self, soup, max_results: int) -> list[PriceResult]:
-        results = []
-        items = soup.select('.sku-item') or soup.select('[class*="sku-item"]')
-        
-        for item in items[:max_results * 2]:
-            if len(results) >= max_results:
-                break
-            try:
-                title_elem = item.select_one('.sku-title a') or item.select_one('h4 a')
-                if not title_elem:
-                    continue
-                name = title_elem.get_text(strip=True)
-                
-                price_elem = item.select_one('.priceView-customer-price span') or item.select_one('[data-testid="customer-price"] span')
-                if not price_elem:
-                    continue
-                price_text = price_elem.get_text(strip=True)
-                cleaned = re.sub(r'[^\d.,]', '', price_text)
-                price = float(cleaned.replace(',', ''))
-                
-                href = title_elem.get('href', '')
-                url = f"{self.BASE_URL}{href}" if href.startswith('/') else href
-                
-                results.append(PriceResult(
-                    platform=self.PLATFORM_ID,
-                    platform_name=self.PLATFORM_NAME,
-                    product_name=name,
-                    price=price,
-                    currency="$",
-                    url=url,
-                    scraped_at=datetime.utcnow().isoformat(),
-                ))
-            except:
-                continue
-        
-        return results
+    try:
+        async with async_playwright() as p:
+            browser, page = await get_stealth_page(p)
+            url = f"https://www.amazon.com/s?k={query.replace(' ', '+')}"
+            html = await stealth_goto(page, url, '[data-component-type="s-search-result"]')
+            await browser.close()
+            return parse_amazon_results(html, max_results, "$", "amazon_us", "Amazon US")
+    except Exception as e:
+        print(f"[Amazon US] Error: {e}")
+        return []
 
 
-# ─── TRENDYOL SCRAPER ───
-
-class TrendyolScraper(BaseScraper):
-    """Trendyol scraper for Turkish market."""
+async def search_amazon_de(query, max_results=5):
+    """Search Amazon DE."""
+    from playwright.async_api import async_playwright
     
-    PLATFORM_ID = "trendyol"
-    PLATFORM_NAME = "Trendyol"
-    BASE_URL = "https://www.trendyol.com"
-    
-    async def search(self, query: str, max_results: int = 5) -> list[PriceResult]:
-        try:
-            import httpx
-            from bs4 import BeautifulSoup
-            
-            search_url = f"{self.BASE_URL}/sr"
-            params = {"q": query}
-            
-            headers = {**self.HEADERS, "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.8"}
-            
-            async with httpx.AsyncClient(
-                headers=headers,
-                follow_redirects=True,
-                timeout=15.0,
-            ) as client:
-                response = await client.get(search_url, params=params)
-                
-                if response.status_code != 200:
-                    print(f"[Trendyol] Status {response.status_code}")
-                    return []
-                
-                soup = BeautifulSoup(response.text, "html.parser")
-                return self._parse_results(soup, max_results)
-                
-        except Exception as e:
-            print(f"[Trendyol] Error: {e}")
-            return []
-    
-    def _parse_results(self, soup, max_results: int) -> list[PriceResult]:
-        results = []
-        items = soup.select('.p-card-wrppr') or soup.select('[class*="prdct-cntnr"]')
-        
-        for item in items[:max_results * 2]:
-            if len(results) >= max_results:
-                break
-            try:
-                # Title
-                title_elem = item.select_one('.prdct-desc-cntnr-name') or item.select_one('span[class*="prdct-desc"]')
-                brand_elem = item.select_one('.prdct-desc-cntnr-ttl') or item.select_one('span[class*="brand"]')
-                
-                brand = brand_elem.get_text(strip=True) if brand_elem else ""
-                title = title_elem.get_text(strip=True) if title_elem else ""
-                name = f"{brand} {title}".strip()
-                if len(name) < 3:
-                    continue
-                
-                # Price - Trendyol uses Turkish format: 42.999,00 TL
-                price_elem = item.select_one('.prc-box-dscntd') or item.select_one('.prc-box-sllng')
-                if not price_elem:
-                    continue
-                
-                price_text = price_elem.get_text(strip=True)
-                price = self._parse_turkish_price(price_text)
-                if not price:
-                    continue
-                
-                # URL
-                link = item.select_one('a')
-                href = link.get('href', '') if link else ''
-                url = f"{self.BASE_URL}{href}" if href.startswith('/') else href
-                
-                results.append(PriceResult(
-                    platform=self.PLATFORM_ID,
-                    platform_name=self.PLATFORM_NAME,
-                    product_name=name,
-                    price=price,
-                    currency="₺",
-                    url=url,
-                    scraped_at=datetime.utcnow().isoformat(),
-                ))
-            except:
-                continue
-        
-        return results
-    
-    def _parse_turkish_price(self, text: str) -> Optional[float]:
-        """Parse Turkish price format: 42.999,00 TL → 42999.00"""
-        cleaned = re.sub(r'[^\d.,]', '', text)
-        if not cleaned:
-            return None
-        try:
-            # Turkish: dots are thousands, comma is decimal
-            cleaned = cleaned.replace('.', '').replace(',', '.')
-            return float(cleaned)
-        except:
-            return None
+    try:
+        async with async_playwright() as p:
+            browser, page = await get_stealth_page(p)
+            url = f"https://www.amazon.de/s?k={query.replace(' ', '+')}"
+            html = await stealth_goto(page, url, '[data-component-type="s-search-result"]')
+            await browser.close()
+            return parse_amazon_results(html, max_results, "EUR", "amazon_de", "Amazon DE")
+    except Exception as e:
+        print(f"[Amazon DE] Error: {e}")
+        return []
 
 
-# ─── HEPSIBURADA SCRAPER ───
-
-class HepsiburadaScraper(BaseScraper):
-    """Hepsiburada scraper."""
+async def search_walmart(query, max_results=5):
+    """Search Walmart with stealth browser."""
+    from playwright.async_api import async_playwright
     
-    PLATFORM_ID = "hepsiburada"
-    PLATFORM_NAME = "Hepsiburada"
-    BASE_URL = "https://www.hepsiburada.com"
-    
-    async def search(self, query: str, max_results: int = 5) -> list[PriceResult]:
-        try:
-            import httpx
-            from bs4 import BeautifulSoup
-            
-            search_url = f"{self.BASE_URL}/ara"
-            params = {"q": query}
-            headers = {**self.HEADERS, "Accept-Language": "tr-TR,tr;q=0.9"}
-            
-            async with httpx.AsyncClient(
-                headers=headers,
-                follow_redirects=True,
-                timeout=15.0,
-            ) as client:
-                response = await client.get(search_url, params=params)
-                
-                if response.status_code != 200:
-                    return []
-                
-                soup = BeautifulSoup(response.text, "html.parser")
-                return self._parse_results(soup, max_results)
-                
-        except Exception as e:
-            print(f"[Hepsiburada] Error: {e}")
-            return []
-    
-    def _parse_results(self, soup, max_results: int) -> list[PriceResult]:
-        results = []
-        items = soup.select('[data-test-id="product-card-item"]') or soup.select('.productListContent-item')
-        
-        for item in items[:max_results * 2]:
-            if len(results) >= max_results:
-                break
-            try:
-                title_elem = item.select_one('[data-test-id="product-card-name"]') or item.select_one('h3')
-                if not title_elem:
-                    continue
-                name = title_elem.get_text(strip=True)
-                
-                price_elem = item.select_one('[data-test-id="price-current-price"]') or item.select_one('.product-price')
-                if not price_elem:
-                    continue
-                price_text = price_elem.get_text(strip=True)
-                cleaned = re.sub(r'[^\d.,]', '', price_text)
-                price = float(cleaned.replace('.', '').replace(',', '.'))
-                
-                link = item.select_one('a')
-                href = link.get('href', '') if link else ''
-                url = f"{self.BASE_URL}{href}" if href and not href.startswith('http') else href
-                
-                results.append(PriceResult(
-                    platform=self.PLATFORM_ID,
-                    platform_name=self.PLATFORM_NAME,
-                    product_name=name,
-                    price=price,
-                    currency="₺",
-                    url=url,
-                    scraped_at=datetime.utcnow().isoformat(),
-                ))
-            except:
-                continue
-        
-        return results
+    try:
+        async with async_playwright() as p:
+            browser, page = await get_stealth_page(p)
+            url = f"https://www.walmart.com/search?q={query.replace(' ', '+')}"
+            html = await stealth_goto(page, url, '[data-item-id]')
+            await browser.close()
+            return parse_walmart_results(html, max_results)
+    except Exception as e:
+        print(f"[Walmart] Error: {e}")
+        return []
 
 
-# ─── AMAZON DE SCRAPER ───
+async def search_bestbuy(query, max_results=5):
+    """Search Best Buy with stealth browser."""
+    from playwright.async_api import async_playwright
+    
+    try:
+        async with async_playwright() as p:
+            browser, page = await get_stealth_page(p)
+            url = f"https://www.bestbuy.com/site/searchpage.jsp?st={query.replace(' ', '+')}"
+            html = await stealth_goto(page, url, ".sku-item")
+            await browser.close()
+            return parse_bestbuy_results(html, max_results)
+    except Exception as e:
+        print(f"[Best Buy] Error: {e}")
+        return []
 
-class AmazonDEScraper(AmazonUSScraper):
-    """Amazon DE - inherits Amazon US logic with DE-specific config."""
+
+async def search_trendyol(query, max_results=5):
+    """Search Trendyol."""
+    from playwright.async_api import async_playwright
     
-    PLATFORM_ID = "amazon_de"
-    PLATFORM_NAME = "Amazon DE"
-    BASE_URL = "https://www.amazon.de"
+    try:
+        async with async_playwright() as p:
+            browser, page = await get_stealth_page(p)
+            url = f"https://www.trendyol.com/sr?q={query.replace(' ', '+')}"
+            html = await stealth_goto(page, url, ".p-card-wrppr")
+            await browser.close()
+            return parse_trendyol_results(html, max_results)
+    except Exception as e:
+        print(f"[Trendyol] Error: {e}")
+        return []
+
+
+async def search_hepsiburada(query, max_results=5):
+    """Search Hepsiburada."""
+    from playwright.async_api import async_playwright
     
-    def _extract_price(self, item) -> Optional[float]:
-        """Override for EU price format."""
-        price_elem = item.select_one('.a-price:not(.a-text-price) .a-offscreen')
-        if price_elem:
-            text = price_elem.get_text()
-            # EU format: 1.199,00 €
-            cleaned = re.sub(r'[^\d.,]', '', text)
-            if cleaned:
-                try:
-                    return float(cleaned.replace('.', '').replace(',', '.'))
-                except:
-                    pass
-        return super()._extract_price(item)
+    try:
+        async with async_playwright() as p:
+            browser, page = await get_stealth_page(p)
+            url = f"https://www.hepsiburada.com/ara?q={query.replace(' ', '+')}"
+            html = await stealth_goto(page, url, '[data-test-id="product-card-item"]')
+            await browser.close()
+            return parse_hepsiburada_results(html, max_results)
+    except Exception as e:
+        print(f"[Hepsiburada] Error: {e}")
+        return []
 
 
 # ─── SCRAPER REGISTRY ───
 
 SCRAPERS = {
     "us": {
-        "amazon_us": AmazonUSScraper(),
-        "walmart": WalmartScraper(),
-        "bestbuy": BestBuyScraper(),
+        "amazon_us": search_amazon_us,
+        "walmart": search_walmart,
+        "bestbuy": search_bestbuy,
     },
     "tr": {
-        "trendyol": TrendyolScraper(),
-        "hepsiburada": HepsiburadaScraper(),
+        "trendyol": search_trendyol,
+        "hepsiburada": search_hepsiburada,
     },
     "eu": {
-        "amazon_de": AmazonDEScraper(),
+        "amazon_de": search_amazon_de,
     },
 }
 
+PLATFORM_NAMES = {
+    "amazon_us": "Amazon US",
+    "walmart": "Walmart",
+    "bestbuy": "Best Buy",
+    "trendyol": "Trendyol",
+    "hepsiburada": "Hepsiburada",
+    "amazon_de": "Amazon DE",
+}
 
-# ─── API ENDPOINTS ───
+
+# ─── API ───
 
 @app.get("/")
 async def root():
     return {
         "name": "HYPE Intelligence API",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "status": "running",
         "supported_regions": list(SCRAPERS.keys()),
+        "scraping_method": "playwright_stealth",
     }
 
 
 @app.get("/api/search", response_model=SearchResponse)
 async def search_products(
-    q: str = Query(..., description="Search query", min_length=1),
-    region: str = Query("us", description="Region: us, tr, eu"),
-    platforms: Optional[str] = Query(None, description="Comma-separated platform IDs. If empty, searches all."),
-    max_results: int = Query(5, description="Max results per platform", ge=1, le=20),
+    q: str = Query(..., min_length=1),
+    region: str = Query("us"),
+    platforms: Optional[str] = Query(None),
+    max_results: int = Query(5, ge=1, le=10),
 ):
-    """
-    Search for products across platforms in a region.
-    
-    Example:
-      GET /api/search?q=iPhone+16+Pro&region=us&max_results=5
-      GET /api/search?q=iPhone+16+Pro&region=us&platforms=amazon_us,walmart
-    """
-    
     if region not in SCRAPERS:
-        raise HTTPException(400, f"Unsupported region: {region}. Use: {list(SCRAPERS.keys())}")
+        raise HTTPException(400, f"Unsupported region: {region}")
     
     region_scrapers = SCRAPERS[region]
     
-    # Filter platforms if specified
     if platforms:
         platform_ids = [p.strip() for p in platforms.split(",")]
-        target_scrapers = {k: v for k, v in region_scrapers.items() if k in platform_ids}
+        targets = {k: v for k, v in region_scrapers.items() if k in platform_ids}
     else:
-        target_scrapers = region_scrapers
+        targets = region_scrapers
     
-    if not target_scrapers:
-        raise HTTPException(400, f"No valid platforms found. Available: {list(region_scrapers.keys())}")
+    if not targets:
+        raise HTTPException(400, f"No valid platforms. Available: {list(region_scrapers.keys())}")
     
     start = time.time()
     
-    # Run all scrapers concurrently
-    tasks = []
-    for platform_id, scraper in target_scrapers.items():
-        tasks.append(scraper.search(q, max_results))
+    # Run scrapers concurrently
+    tasks = [func(q, max_results) for func in targets.values()]
+    results_nested = await asyncio.gather(*tasks, return_exceptions=True)
     
-    all_results_nested = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    # Flatten and filter errors
     all_results = []
-    for result in all_results_nested:
-        if isinstance(result, Exception):
-            print(f"Scraper error: {result}")
+    for r in results_nested:
+        if isinstance(r, Exception):
+            print(f"Scraper error: {r}")
             continue
-        all_results.extend(result)
+        all_results.extend(r)
     
-    elapsed_ms = int((time.time() - start) * 1000)
+    elapsed = int((time.time() - start) * 1000)
     
     return SearchResponse(
         query=q,
         region=region,
-        platforms_searched=list(target_scrapers.keys()),
+        platforms_searched=list(targets.keys()),
         results=all_results,
         total_results=len(all_results),
-        search_time_ms=elapsed_ms,
+        search_time_ms=elapsed,
     )
 
 
 @app.get("/api/platforms")
 async def list_platforms(region: Optional[str] = None):
-    """List available platforms, optionally filtered by region."""
     if region:
         if region not in SCRAPERS:
             raise HTTPException(400, f"Unsupported region: {region}")
-        return {
-            "region": region,
-            "platforms": [
-                {"id": k, "name": v.PLATFORM_NAME}
-                for k, v in SCRAPERS[region].items()
-            ],
-        }
-    
+        return {"region": region, "platforms": [{"id": k, "name": PLATFORM_NAMES.get(k, k)} for k in SCRAPERS[region]]}
     return {
         "regions": {
-            reg: [{"id": k, "name": v.PLATFORM_NAME} for k, v in scrapers.items()]
+            reg: [{"id": k, "name": PLATFORM_NAMES.get(k, k)} for k in scrapers]
             for reg, scrapers in SCRAPERS.items()
         }
     }
@@ -781,10 +692,8 @@ async def list_platforms(region: Optional[str] = None):
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
+    return {"status": "ok", "timestamp": datetime.utcnow().isoformat(), "version": "2.0.0"}
 
-
-# ─── RUN ───
 
 if __name__ == "__main__":
     import uvicorn

@@ -1,8 +1,8 @@
 """
-HYPE Intelligence — Scraper Backend v4.0
+HYPE Intelligence — Scraper Backend v5.0
 =========================================
-SerpAPI Google Shopping + Amazon direct + Akakce/Cimri Playwright.
-Best of both worlds: reliable API + direct scraping.
+Multi-engine SerpAPI: Amazon + Walmart + eBay + Google Shopping
+All results return REAL product URLs — no Google redirects.
 
 uvicorn main:app --reload --port 8000
 """
@@ -13,10 +13,8 @@ from pydantic import BaseModel
 from typing import Optional
 from urllib.parse import urlparse, parse_qs
 import asyncio
-import json
 import re
 import time
-import random
 import traceback
 import logging
 import os
@@ -25,7 +23,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger("hype")
 
-app = FastAPI(title="HYPE Intelligence API", version="4.0.0")
+app = FastAPI(title="HYPE Intelligence API", version="5.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -35,7 +33,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# SerpAPI Key — env variable override available
 SERPAPI_KEY = os.environ.get("SERPAPI_KEY", "008f10fdf7243f76a522c290d21a1a13f19f16bb98c0a43bc22f836e9819ce15")
 
 
@@ -56,7 +53,7 @@ class PriceResult(BaseModel):
     image_url: Optional[str] = None
     in_stock: bool = True
     scraped_at: str
-    source: str = "direct"
+    source: str = "serpapi"
 
 class SearchResponse(BaseModel):
     query: str
@@ -69,44 +66,230 @@ class SearchResponse(BaseModel):
 
 
 # ═══════════════════════════════════════════
-#  URL UTILS
+#  SERPAPI HELPER
 # ═══════════════════════════════════════════
 
-def extract_real_url(raw_url: str) -> str:
-    """
-    Google Shopping URL'lerinden gerçek satıcı URL'sini çıkarır.
-    Örnek: google.com/aclk?...&adurl=https://www.nike.com/... → https://www.nike.com/...
-    """
-    if not raw_url:
-        return ""
-    if "google.com" not in raw_url:
-        return raw_url
-    try:
-        parsed = urlparse(raw_url)
-        params = parse_qs(parsed.query)
-        # Google farklı parametrelerde gerçek URL'yi saklıyor
-        for key in ["url", "adurl", "q", "dest"]:
-            if key in params and params[key]:
-                candidate = params[key][0]
-                if candidate.startswith("http"):
-                    return candidate
-    except Exception:
-        pass
-    return raw_url
-
-
-# ═══════════════════════════════════════════
-#  SERPAPI — GOOGLE SHOPPING (US / EU / TR)
-# ═══════════════════════════════════════════
-
-async def search_serpapi_shopping(query: str, region: str = "us", max_results: int = 15):
-    """
-    SerpAPI Google Shopping — returns structured JSON.
-    One request = prices from Amazon, Walmart, Best Buy, Target, eBay, etc.
-    Works for US, EU, and TR.
-    """
+async def serpapi_request(params: dict) -> dict:
+    """Single SerpAPI request with error handling."""
     import httpx
+    params["api_key"] = SERPAPI_KEY
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get("https://serpapi.com/search.json", params=params)
+            if response.status_code != 200:
+                logger.error(f"[SerpAPI] HTTP {response.status_code}: {response.text[:200]}")
+                return {}
+            data = response.json()
+            if "error" in data:
+                logger.error(f"[SerpAPI] Error: {data['error']}")
+                return {}
+            return data
+    except Exception as e:
+        logger.error(f"[SerpAPI] Request failed: {e}")
+        return {}
 
+
+# ═══════════════════════════════════════════
+#  AMAZON (SerpAPI engine=amazon)
+# ═══════════════════════════════════════════
+
+async def search_amazon(query: str, max_results: int = 5) -> list[PriceResult]:
+    """
+    SerpAPI Amazon Search — returns real Amazon product URLs.
+    Response: organic_results[].link = "https://www.amazon.com/dp/B0..."
+    """
+    logger.info(f"[Amazon] Searching: {query}")
+    data = await serpapi_request({
+        "engine": "amazon",
+        "k": query,
+        "amazon_domain": "amazon.com",
+        "language": "en_US",
+    })
+
+    results = []
+    for item in data.get("organic_results", [])[:max_results]:
+        try:
+            name = item.get("title", "")
+            if not name or len(name) < 5:
+                continue
+
+            # Skip sponsored
+            if item.get("sponsored"):
+                continue
+
+            # Price
+            price = None
+            if item.get("extracted_price") is not None:
+                price = float(item["extracted_price"])
+            elif item.get("price"):
+                price = _extract_any_price(item["price"])
+            if not price or price <= 0:
+                continue
+
+            # URL — real Amazon product page
+            url = item.get("link", "")
+            if not url:
+                continue
+
+            results.append(PriceResult(
+                platform="amazon",
+                platform_name="Amazon",
+                product_name=name,
+                price=price,
+                currency="$",
+                url=url,
+                seller="Amazon",
+                rating=_safe_float(item.get("rating")),
+                review_count=_safe_int(item.get("reviews")),
+                image_url=item.get("thumbnail"),
+                scraped_at=datetime.utcnow().isoformat(),
+                source="serpapi_amazon",
+            ))
+        except Exception as e:
+            logger.warning(f"[Amazon] Parse error: {e}")
+            continue
+
+    logger.info(f"[Amazon] Got {len(results)} results")
+    return results
+
+
+# ═══════════════════════════════════════════
+#  WALMART (SerpAPI engine=walmart)
+# ═══════════════════════════════════════════
+
+async def search_walmart(query: str, max_results: int = 5) -> list[PriceResult]:
+    """
+    SerpAPI Walmart Search — returns real Walmart product URLs.
+    Response: organic_results[].product_page_url = "https://www.walmart.com/ip/..."
+    """
+    logger.info(f"[Walmart] Searching: {query}")
+    data = await serpapi_request({
+        "engine": "walmart",
+        "query": query,
+    })
+
+    results = []
+    for item in data.get("organic_results", [])[:max_results]:
+        try:
+            name = item.get("title", "")
+            if not name or len(name) < 5:
+                continue
+
+            # Sponsored check
+            if item.get("sponsored"):
+                continue
+
+            # Price
+            price = None
+            if item.get("primary_offer", {}).get("offer_price") is not None:
+                price = float(item["primary_offer"]["offer_price"])
+            elif item.get("price") is not None:
+                price = _extract_any_price(str(item["price"]))
+            if not price or price <= 0:
+                continue
+
+            # URL — real Walmart product page
+            url = item.get("product_page_url", "") or item.get("link", "")
+            if not url:
+                continue
+            # Ensure full URL
+            if url.startswith("/"):
+                url = f"https://www.walmart.com{url}"
+
+            results.append(PriceResult(
+                platform="walmart",
+                platform_name="Walmart",
+                product_name=name,
+                price=price,
+                currency="$",
+                url=url,
+                seller="Walmart",
+                rating=_safe_float(item.get("rating")),
+                review_count=_safe_int(item.get("reviews")),
+                image_url=item.get("thumbnail"),
+                scraped_at=datetime.utcnow().isoformat(),
+                source="serpapi_walmart",
+            ))
+        except Exception as e:
+            logger.warning(f"[Walmart] Parse error: {e}")
+            continue
+
+    logger.info(f"[Walmart] Got {len(results)} results")
+    return results
+
+
+# ═══════════════════════════════════════════
+#  EBAY (SerpAPI engine=ebay)
+# ═══════════════════════════════════════════
+
+async def search_ebay(query: str, max_results: int = 5) -> list[PriceResult]:
+    """
+    SerpAPI eBay Search — returns real eBay listing URLs.
+    Response: organic_results[].link = "https://www.ebay.com/itm/..."
+    """
+    logger.info(f"[eBay] Searching: {query}")
+    data = await serpapi_request({
+        "engine": "ebay",
+        "_nkw": query,
+        "ebay_domain": "ebay.com",
+    })
+
+    results = []
+    for item in data.get("organic_results", [])[:max_results]:
+        try:
+            name = item.get("title", "")
+            if not name or len(name) < 5:
+                continue
+
+            # Price
+            price = None
+            if item.get("price"):
+                if isinstance(item["price"], dict):
+                    # eBay can return {"raw": "$25.99", "extracted": 25.99}
+                    price = _safe_float(item["price"].get("extracted"))
+                    if not price:
+                        price = _extract_any_price(item["price"].get("raw", ""))
+                else:
+                    price = _extract_any_price(str(item["price"]))
+            if not price or price <= 0:
+                continue
+
+            # URL — real eBay listing page
+            url = item.get("link", "")
+            if not url:
+                continue
+
+            results.append(PriceResult(
+                platform="ebay",
+                platform_name="eBay",
+                product_name=name,
+                price=price,
+                currency="$",
+                url=url,
+                seller=item.get("seller", {}).get("name", "eBay Seller") if isinstance(item.get("seller"), dict) else "eBay",
+                rating=_safe_float(item.get("reviews", {}).get("rating")) if isinstance(item.get("reviews"), dict) else None,
+                review_count=_safe_int(item.get("reviews", {}).get("count")) if isinstance(item.get("reviews"), dict) else None,
+                image_url=item.get("thumbnail"),
+                scraped_at=datetime.utcnow().isoformat(),
+                source="serpapi_ebay",
+            ))
+        except Exception as e:
+            logger.warning(f"[eBay] Parse error: {e}")
+            continue
+
+    logger.info(f"[eBay] Got {len(results)} results")
+    return results
+
+
+# ═══════════════════════════════════════════
+#  GOOGLE SHOPPING (SerpAPI engine=google_shopping)
+# ═══════════════════════════════════════════
+
+async def search_google_shopping(query: str, region: str = "us", max_results: int = 5) -> list[PriceResult]:
+    """
+    SerpAPI Google Shopping — aggregator results from many stores.
+    URLs are Google redirects, so we extract real URLs where possible.
+    """
     config = {
         "us": {"gl": "us", "hl": "en", "currency": "$", "location": "United States"},
         "eu": {"gl": "de", "hl": "de", "currency": "€", "location": "Germany"},
@@ -114,262 +297,59 @@ async def search_serpapi_shopping(query: str, region: str = "us", max_results: i
     }
     cfg = config.get(region, config["us"])
 
-    params = {
+    logger.info(f"[Google Shopping] Searching: {query} | region={region}")
+    data = await serpapi_request({
         "engine": "google_shopping",
         "q": query,
         "gl": cfg["gl"],
         "hl": cfg["hl"],
         "location": cfg["location"],
-        "api_key": SERPAPI_KEY,
         "num": max_results,
-    }
+    })
 
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            logger.info(f"[SerpAPI] Searching: {query} | region={region}")
-            response = await client.get("https://serpapi.com/search.json", params=params)
-
-            if response.status_code != 200:
-                logger.error(f"[SerpAPI] HTTP {response.status_code}: {response.text[:200]}")
-                return []
-
-            data = response.json()
-
-            # Check for errors
-            if "error" in data:
-                logger.error(f"[SerpAPI] Error: {data['error']}")
-                return []
-
-            results = []
-
-            # Parse shopping_results
-            shopping = data.get("shopping_results", [])
-            logger.info(f"[SerpAPI] Got {len(shopping)} shopping results")
-
-            for item in shopping[:max_results]:
-                try:
-                    name = item.get("title", "")
-                    if not name:
-                        continue
-
-                    # Price extraction
-                    price = None
-                    price_raw = item.get("extracted_price")
-                    if price_raw is not None:
-                        price = float(price_raw)
-                    else:
-                        price_str = item.get("price", "")
-                        price = _extract_any_price(price_str)
-
-                    if not price or price <= 0:
-                        continue
-
-                    # Seller / Source
-                    seller = item.get("source", "") or item.get("seller", "")
-                    platform_id, platform_name = _identify_platform(seller, region)
-
-                    # URL — gerçek satıcı URL'sini çıkar
-                    raw_url = item.get("link") or item.get("product_link") or ""
-                    url = extract_real_url(raw_url)
-
-                    # Rating
-                    rating = None
-                    if item.get("rating"):
-                        try:
-                            rating = float(item["rating"])
-                        except:
-                            pass
-
-                    # Reviews
-                    review_count = None
-                    if item.get("reviews"):
-                        try:
-                            review_count = int(item["reviews"])
-                        except:
-                            pass
-
-                    # Image
-                    image = item.get("thumbnail") or item.get("image") or None
-
-                    results.append(PriceResult(
-                        platform=platform_id,
-                        platform_name=platform_name,
-                        product_name=name,
-                        price=price,
-                        currency=cfg["currency"],
-                        url=url,
-                        seller=seller,
-                        rating=rating,
-                        review_count=review_count,
-                        image_url=image,
-                        scraped_at=datetime.utcnow().isoformat(),
-                        source="serpapi_google_shopping",
-                    ))
-                except Exception as e:
-                    logger.warning(f"[SerpAPI] Parse error: {e}")
-                    continue
-
-            logger.info(f"[SerpAPI] Parsed {len(results)} results")
-            return results
-
-    except Exception as e:
-        logger.error(f"[SerpAPI] Error: {e}\n{traceback.format_exc()}")
-        return []
-
-
-# ═══════════════════════════════════════════
-#  AMAZON DIRECT (proven working)
-# ═══════════════════════════════════════════
-
-async def search_amazon_us(query, max_results=5):
-    from playwright.async_api import async_playwright
-
-    try:
-        async with async_playwright() as p:
-            browser, page = await create_stealth_browser(p)
-            url = f"https://www.amazon.com/s?k={query.replace(' ', '+')}"
-            logger.info(f"[Amazon US] Navigating...")
-
-            html = await stealth_navigate(page, url, '[data-component-type="s-search-result"]')
-            await browser.close()
-
-            results = _parse_amazon_html(html, max_results, "$", "amazon_us", "Amazon US")
-            logger.info(f"[Amazon US] Got {len(results)} results")
-            return results
-    except Exception as e:
-        logger.error(f"[Amazon US] Error: {e}\n{traceback.format_exc()}")
-        return []
-
-
-# ═══════════════════════════════════════════
-#  STEALTH BROWSER (for Amazon + future TR scrapers)
-# ═══════════════════════════════════════════
-
-async def create_stealth_browser(playwright, locale="en-US", timezone="America/New_York"):
-    browser = await playwright.chromium.launch(
-        headless=True,
-        args=[
-            "--disable-blink-features=AutomationControlled",
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-            "--single-process",
-        ]
-    )
-    context = await browser.new_context(
-        viewport={"width": 1920, "height": 1080},
-        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        locale=locale,
-        timezone_id=timezone,
-        java_script_enabled=True,
-        color_scheme="light",
-    )
-    await context.add_init_script("""
-        Object.defineProperty(navigator, 'webdriver', { get: () => false });
-        Object.defineProperty(navigator, 'plugins', {
-            get: () => [
-                { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
-                { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
-                { name: 'Native Client', filename: 'internal-nacl-plugin' },
-            ]
-        });
-        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-        window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){} };
-    """)
-    page = await context.new_page()
-    return browser, page
-
-
-async def stealth_navigate(page, url, wait_for=None, timeout=25000):
-    await asyncio.sleep(random.uniform(0.5, 1.5))
-    response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
-    await asyncio.sleep(random.uniform(1.5, 3.0))
-    if wait_for:
-        try:
-            await page.wait_for_selector(wait_for, timeout=8000)
-        except:
-            await asyncio.sleep(2)
-    await page.evaluate("window.scrollBy(0, Math.floor(Math.random() * 400) + 200)")
-    await asyncio.sleep(random.uniform(0.5, 1.0))
-    return await page.content()
-
-
-# ═══════════════════════════════════════════
-#  AMAZON HTML PARSER
-# ═══════════════════════════════════════════
-
-def _parse_amazon_html(html, max_results, currency, platform_id, platform_name):
-    from bs4 import BeautifulSoup
-    soup = BeautifulSoup(html, "html.parser")
     results = []
-    items = soup.select('[data-component-type="s-search-result"]')
-
-    for item in items:
-        if len(results) >= max_results:
-            break
+    for item in data.get("shopping_results", [])[:max_results]:
         try:
-            if item.select_one('[data-component-type="sp-sponsored-result"]'):
-                continue
-            if item.find(string=re.compile(r"Sponsored", re.I)):
-                continue
-
-            title_el = item.select_one("h2 a span") or item.select_one("h2 span")
-            if not title_el:
-                continue
-            name = title_el.get_text(strip=True)
-            if len(name) < 5:
+            name = item.get("title", "")
+            if not name:
                 continue
 
+            # Price
             price = None
-            offscreen = item.select_one(".a-price:not(.a-text-price) .a-offscreen")
-            if offscreen:
-                price = _extract_any_price(offscreen.get_text())
-            if not price:
-                whole = item.select_one(".a-price:not(.a-text-price) .a-price-whole")
-                frac = item.select_one(".a-price:not(.a-text-price) .a-price-fraction")
-                if whole:
-                    w = whole.get_text(strip=True).replace(",", "").replace(".", "")
-                    f = frac.get_text(strip=True) if frac else "00"
-                    try:
-                        price = float(f"{w}.{f}")
-                    except:
-                        pass
-            if not price:
+            if item.get("extracted_price") is not None:
+                price = float(item["extracted_price"])
+            else:
+                price = _extract_any_price(item.get("price", ""))
+            if not price or price <= 0:
                 continue
 
-            link_el = item.select_one("h2 a")
-            url = ""
-            if link_el and link_el.get("href"):
-                href = link_el["href"]
-                url = f"https://www.amazon.com{href}" if href.startswith("/") else href
+            # Seller
+            seller = item.get("source", "") or item.get("seller", "")
+            platform_id, platform_name = _identify_platform(seller, region)
 
-            rating = None
-            rating_el = item.select_one("[aria-label*='out of 5']")
-            if rating_el:
-                m = re.search(r"(\d+\.?\d*)\s+out", rating_el.get("aria-label", ""))
-                if m:
-                    rating = float(m.group(1))
-
-            img = None
-            img_el = item.select_one("img.s-image")
-            if img_el:
-                img = img_el.get("src")
+            # URL — try to extract real URL from Google redirect
+            raw_url = item.get("link") or item.get("product_link") or ""
+            url = _extract_real_url(raw_url)
 
             results.append(PriceResult(
                 platform=platform_id,
                 platform_name=platform_name,
                 product_name=name,
                 price=price,
-                currency=currency,
+                currency=cfg["currency"],
                 url=url,
-                rating=rating,
-                image_url=img,
+                seller=seller,
+                rating=_safe_float(item.get("rating")),
+                review_count=_safe_int(item.get("reviews")),
+                image_url=item.get("thumbnail") or item.get("image"),
                 scraped_at=datetime.utcnow().isoformat(),
-                source="direct",
+                source="serpapi_google_shopping",
             ))
-        except:
+        except Exception as e:
+            logger.warning(f"[Google Shopping] Parse error: {e}")
             continue
+
+    logger.info(f"[Google Shopping] Got {len(results)} results")
     return results
 
 
@@ -377,7 +357,7 @@ def _parse_amazon_html(html, max_results, currency, platform_id, platform_name):
 #  UTILS
 # ═══════════════════════════════════════════
 
-def _extract_any_price(text):
+def _extract_any_price(text) -> Optional[float]:
     """Extract price from any format."""
     if not text:
         return None
@@ -401,12 +381,49 @@ def _extract_any_price(text):
         return None
 
 
-def _identify_platform(seller, region):
+def _safe_float(val) -> Optional[float]:
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except:
+        return None
+
+
+def _safe_int(val) -> Optional[int]:
+    if val is None:
+        return None
+    try:
+        return int(val)
+    except:
+        return None
+
+
+def _extract_real_url(raw_url: str) -> str:
+    """Extract real seller URL from Google redirect URLs."""
+    if not raw_url:
+        return ""
+    if "google.com" not in raw_url:
+        return raw_url
+    try:
+        parsed = urlparse(raw_url)
+        params = parse_qs(parsed.query)
+        for key in ["url", "adurl", "q", "dest"]:
+            if key in params and params[key]:
+                candidate = params[key][0]
+                if candidate.startswith("http"):
+                    return candidate
+    except:
+        pass
+    return raw_url
+
+
+def _identify_platform(seller: str, region: str) -> tuple[str, str]:
     if not seller:
         return "unknown", "Unknown"
     s = seller.lower()
     mappings = {
-        "amazon": ("amazon_us" if region == "us" else "amazon_de" if region == "eu" else "amazon_tr", "Amazon"),
+        "amazon": ("amazon", "Amazon"),
         "walmart": ("walmart", "Walmart"),
         "best buy": ("bestbuy", "Best Buy"),
         "bestbuy": ("bestbuy", "Best Buy"),
@@ -415,6 +432,8 @@ def _identify_platform(seller, region):
         "newegg": ("newegg", "Newegg"),
         "b&h": ("bh", "B&H Photo"),
         "apple": ("apple", "Apple"),
+        "nike": ("nike", "Nike"),
+        "adidas": ("adidas", "Adidas"),
         "trendyol": ("trendyol", "Trendyol"),
         "hepsiburada": ("hepsiburada", "Hepsiburada"),
         "n11": ("n11", "n11"),
@@ -434,36 +453,52 @@ def _identify_platform(seller, region):
 #  SEARCH ORCHESTRATOR
 # ═══════════════════════════════════════════
 
-async def search_region(query, region, max_results=15):
-    tasks = []
-    sources = []
+async def search_region(query: str, region: str, max_results: int = 15):
+    """
+    Run all relevant engines in parallel.
+    US: Amazon + Walmart + eBay + Google Shopping (4 credits)
+    EU: Google Shopping (1 credit) — platform APIs are US-only
+    TR: Google Shopping (1 credit)
+    """
+    per_engine = max(3, max_results // 4)
 
     if region == "us":
-        # SerpAPI Google Shopping + Amazon direct
-        tasks.append(search_serpapi_shopping(query, "us", max_results))
-        tasks.append(search_amazon_us(query, min(max_results, 5)))
-        sources = ["serpapi_google_shopping", "amazon_us_direct"]
-
-    elif region == "tr":
-        # SerpAPI Google Shopping Turkey
-        tasks.append(search_serpapi_shopping(query, "tr", max_results))
-        sources = ["serpapi_google_shopping_tr"]
+        tasks = [
+            search_amazon(query, per_engine),
+            search_walmart(query, per_engine),
+            search_ebay(query, per_engine),
+            search_google_shopping(query, "us", per_engine),
+        ]
+        sources = ["amazon", "walmart", "ebay", "google_shopping"]
 
     elif region == "eu":
-        # SerpAPI Google Shopping Germany
-        tasks.append(search_serpapi_shopping(query, "eu", max_results))
-        sources = ["serpapi_google_shopping_eu"]
+        tasks = [
+            search_google_shopping(query, "eu", max_results),
+        ]
+        sources = ["google_shopping_eu"]
+
+    elif region == "tr":
+        tasks = [
+            search_google_shopping(query, "tr", max_results),
+        ]
+        sources = ["google_shopping_tr"]
+
+    else:
+        return [], []
 
     results_nested = await asyncio.gather(*tasks, return_exceptions=True)
 
     all_results = []
-    for r in results_nested:
+    active_sources = []
+    for i, r in enumerate(results_nested):
         if isinstance(r, Exception):
-            logger.error(f"Search error: {r}")
+            logger.error(f"Search error [{sources[i]}]: {r}")
             continue
-        all_results.extend(r)
+        if r:
+            all_results.extend(r)
+            active_sources.append(sources[i])
 
-    # Deduplicate by normalized name
+    # Deduplicate by normalized product name
     seen = set()
     unique = []
     for r in all_results:
@@ -474,7 +509,7 @@ async def search_region(query, region, max_results=15):
 
     # Sort by price
     unique.sort(key=lambda x: x.price)
-    return unique[:max_results], sources
+    return unique[:max_results], active_sources
 
 
 # ═══════════════════════════════════════════
@@ -485,10 +520,12 @@ async def search_region(query, region, max_results=15):
 async def root():
     return {
         "name": "HYPE Intelligence API",
-        "version": "4.0.0",
+        "version": "5.0.0",
         "status": "running",
         "supported_regions": ["us", "tr", "eu"],
-        "strategy": "serpapi_google_shopping + amazon_direct",
+        "strategy": "serpapi_multi_engine: amazon + walmart + ebay + google_shopping",
+        "credits_per_us_search": 4,
+        "credits_per_eu_tr_search": 1,
         "serpapi_key_set": bool(SERPAPI_KEY),
     }
 
@@ -523,35 +560,60 @@ async def debug_search(
     q: str = Query("iPhone 16 Pro"),
     region: str = Query("us"),
 ):
-    debug_info = {"query": q, "region": region, "results": {}, "errors": {}}
+    """Debug endpoint — shows raw results from each engine with URLs."""
+    debug_info = {"query": q, "region": region, "engines": {}, "errors": {}}
 
-    # Test SerpAPI
-    try:
-        serp = await search_serpapi_shopping(q, region, 5)
-        debug_info["results"]["serpapi"] = {
-            "count": len(serp),
-            "items": [{"name": r.product_name, "price": r.price, "platform": r.platform, "seller": r.seller, "url": r.url} for r in serp]
-        }
-    except Exception as e:
-        debug_info["errors"]["serpapi"] = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
+    engines = {
+        "amazon": search_amazon(q, 3),
+        "walmart": search_walmart(q, 3),
+        "ebay": search_ebay(q, 3),
+        "google_shopping": search_google_shopping(q, region, 3),
+    }
 
-    # Test Amazon (US only)
-    if region == "us":
+    for name, coro in engines.items():
         try:
-            az = await search_amazon_us(q, 3)
-            debug_info["results"]["amazon_us"] = {
-                "count": len(az),
-                "items": [{"name": r.product_name, "price": r.price, "url": r.url} for r in az]
+            results = await coro
+            debug_info["engines"][name] = {
+                "count": len(results),
+                "items": [
+                    {
+                        "name": r.product_name[:80],
+                        "price": r.price,
+                        "currency": r.currency,
+                        "url": r.url,
+                        "platform": r.platform_name,
+                    }
+                    for r in results
+                ],
             }
         except Exception as e:
-            debug_info["errors"]["amazon_us"] = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
+            debug_info["errors"][name] = f"{type(e).__name__}: {str(e)}"
 
     return debug_info
 
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "timestamp": datetime.utcnow().isoformat(), "version": "4.0.0"}
+    return {"status": "ok", "timestamp": datetime.utcnow().isoformat(), "version": "5.0.0"}
+
+
+@app.get("/api/credits")
+async def credits_info():
+    """Show credit usage info."""
+    return {
+        "plan": "free",
+        "monthly_limit": 250,
+        "cost_per_search": {
+            "us": "4 credits (amazon + walmart + ebay + google_shopping)",
+            "eu": "1 credit (google_shopping)",
+            "tr": "1 credit (google_shopping)",
+        },
+        "estimated_searches": {
+            "us_only": "~62/month",
+            "eu_or_tr_only": "~250/month",
+            "mixed": "depends on usage",
+        },
+    }
 
 
 if __name__ == "__main__":

@@ -141,7 +141,7 @@ async def search_serpapi_shopping(query: str, region: str = "us", max_results: i
                     platform_id, platform_name = _identify_platform(seller, region)
 
                     # URL
-                    url = item.get("product_link") or item.get("link") or ""
+                    url = item.get("link") or item.get("product_link") or ""
 
                     # Rating
                     rating = None

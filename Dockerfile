@@ -19,6 +19,8 @@ RUN apt-get update && apt-get install -y \
     libxrandr2 \
     libpango-1.0-0 \
     libcairo2 \
+    libcups2 \
+    libxfixes3 \
     fonts-liberation \
     fonts-noto-core \
     && rm -rf /var/lib/apt/lists/*

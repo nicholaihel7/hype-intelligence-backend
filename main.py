@@ -11,6 +11,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
+from urllib.parse import urlparse, parse_qs
 import asyncio
 import json
 import re
@@ -65,6 +66,33 @@ class SearchResponse(BaseModel):
     total_results: int
     search_time_ms: int
     sources_used: list[str]
+
+
+# ═══════════════════════════════════════════
+#  URL UTILS
+# ═══════════════════════════════════════════
+
+def extract_real_url(raw_url: str) -> str:
+    """
+    Google Shopping URL'lerinden gerçek satıcı URL'sini çıkarır.
+    Örnek: google.com/aclk?...&adurl=https://www.nike.com/... → https://www.nike.com/...
+    """
+    if not raw_url:
+        return ""
+    if "google.com" not in raw_url:
+        return raw_url
+    try:
+        parsed = urlparse(raw_url)
+        params = parse_qs(parsed.query)
+        # Google farklı parametrelerde gerçek URL'yi saklıyor
+        for key in ["url", "adurl", "q", "dest"]:
+            if key in params and params[key]:
+                candidate = params[key][0]
+                if candidate.startswith("http"):
+                    return candidate
+    except Exception:
+        pass
+    return raw_url
 
 
 # ═══════════════════════════════════════════
@@ -140,8 +168,9 @@ async def search_serpapi_shopping(query: str, region: str = "us", max_results: i
                     seller = item.get("source", "") or item.get("seller", "")
                     platform_id, platform_name = _identify_platform(seller, region)
 
-                    # URL
-                    url = item.get("link") or item.get("product_link") or ""
+                    # URL — gerçek satıcı URL'sini çıkar
+                    raw_url = item.get("link") or item.get("product_link") or ""
+                    url = extract_real_url(raw_url)
 
                     # Rating
                     rating = None
@@ -501,7 +530,7 @@ async def debug_search(
         serp = await search_serpapi_shopping(q, region, 5)
         debug_info["results"]["serpapi"] = {
             "count": len(serp),
-            "items": [{"name": r.product_name, "price": r.price, "platform": r.platform, "seller": r.seller} for r in serp]
+            "items": [{"name": r.product_name, "price": r.price, "platform": r.platform, "seller": r.seller, "url": r.url} for r in serp]
         }
     except Exception as e:
         debug_info["errors"]["serpapi"] = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
@@ -512,7 +541,7 @@ async def debug_search(
             az = await search_amazon_us(q, 3)
             debug_info["results"]["amazon_us"] = {
                 "count": len(az),
-                "items": [{"name": r.product_name, "price": r.price} for r in az]
+                "items": [{"name": r.product_name, "price": r.price, "url": r.url} for r in az]
             }
         except Exception as e:
             debug_info["errors"]["amazon_us"] = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"

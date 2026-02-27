@@ -1004,7 +1004,24 @@ async def debug_search(
 
     return debug_info
 
-
+@app.get("/api/peek")
+async def peek_html(
+    url: str = Query("https://www.google.com/search?q=iPhone+16+Pro&tbm=shop&gl=us&hl=en"),
+    start: int = Query(0),
+    length: int = Query(5000),
+):
+    """Peek at page HTML to find correct selectors."""
+    from playwright.async_api import async_playwright
+    try:
+        async with async_playwright() as p:
+            browser, page = await create_stealth_browser(p)
+            html = await stealth_navigate(page, url)
+            await browser.close()
+            snippet = html[start:start+length]
+            return {"url": url, "total_length": len(html), "start": start, "length": len(snippet), "html": snippet}
+    except Exception as e:
+        return {"error": str(e)}
+        
 @app.get("/api/health")
 async def health():
     return {"status": "ok", "timestamp": datetime.utcnow().isoformat(), "version": "3.0.0"}
